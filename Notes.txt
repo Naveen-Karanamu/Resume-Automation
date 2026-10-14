@@ -1,0 +1,8 @@
+email=varunsrisaivemuri9@gmail.com
+password=varunsrisaivemuri9
+candidate=Vemuri Varun Sri Sai
+category=Data Scientist, AI ML Engineer, Data Analyst
+date=10/14/2026
+experience=6
+max_pages=1
+sheets_url=https://docs.google.com/spreadsheets/d/1dJr6om1Q3V1KaLuUDi8t1_4jY1bV52JAE9Z-01oHJz0/edit?gid=807850051#gid=807850051
