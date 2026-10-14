@@ -111,39 +111,122 @@ def login(page, email, password):
     print(f"  [+] Logged in. URL: {page.url}")
 
 
+RAW_RESUME_HINT = "RAW"   # the RAW template card contains this in its title
+
+
+def _get_resume_cards(page):
+    """Return the list of resume-card title locators currently in the panel."""
+    return page.locator('[class*="translate"] .flex-1.min-w-0.cursor-pointer').all()
+
+
 def load_last_resume(page):
     """
-    Click 'My Resumes' in the navbar, then click the title of the LAST resume
-    card (the RAW resume at the bottom). Each card has a div.flex-1.min-w-0.cursor-pointer
-    wrapping the h3 title — clicking that loads the resume without duplicating it.
+    Open 'My Resumes' and click the RAW resume card (preferred by its name,
+    e.g. 'Ajay ... RAW Resume'); fall back to the LAST card if no RAW match.
+
+    This is made robust against the intermittent 'Found 0 cards' failure by:
+      - retrying the panel-open up to 3 times,
+      - polling for cards to render (instead of a single fixed-wait read),
+      - verifying the resume actually loaded (form fields populate), retrying.
     """
-    print("  [*] Opening 'My Resumes' panel...")
-    page.click('button[title="My Saved Resumes"]')
+    for attempt in range(1, 4):
+        # If cards are already visible (panel already open), skip re-opening.
+        cards = _get_resume_cards(page)
+        if not cards:
+            print(f"  [*] Opening 'My Resumes' panel (attempt {attempt})...")
+            opened = False
+            for sel in ('button[title="My Saved Resumes"]',
+                        'button:has-text("My Resumes")',
+                        'button:has-text("My Saved Resumes")'):
+                try:
+                    btn = page.locator(sel).first
+                    if btn.count() > 0:
+                        btn.click(timeout=5000)
+                        opened = True
+                        break
+                except Exception:
+                    continue
+            if not opened:
+                print("    [!] My Resumes button not clickable — retrying...")
+                time.sleep(2)
+                continue
 
-    # Wait for the panel to slide in (it transitions from translate-x-full)
-    page.wait_for_function("""() => {
-        const el = document.querySelector('[class*="translate"]');
-        return el && !el.className.includes('translate-x-full');
-    }""", timeout=10000)
-    time.sleep(1)
+            # Wait for the panel to slide in.
+            try:
+                page.wait_for_function("""() => {
+                    const el = document.querySelector('[class*="translate"]');
+                    return el && !el.className.includes('translate-x-full');
+                }""", timeout=8000)
+            except Exception:
+                pass
 
-    # Each resume card row has: div.flex-1.min-w-0.cursor-pointer > h3 (title)
-    # Clicking that div loads the resume. The buttons inside are Duplicate + Delete.
-    card_title_divs = page.locator('[class*="translate"] .flex-1.min-w-0.cursor-pointer').all()
-    print(f"  [*] Found {len(card_title_divs)} resume card(s).")
+        # Poll for cards to actually render (up to ~8s) instead of reading once.
+        for _ in range(16):
+            cards = _get_resume_cards(page)
+            if cards:
+                break
+            time.sleep(0.5)
 
-    if not card_title_divs:
-        print("  [!] No resume cards found in panel.")
-        return
+        if not cards:
+            print("    [!] No resume cards yet — closing & retrying panel...")
+            # press Escape / re-click the button to toggle the panel and retry
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            time.sleep(1.5)
+            continue
 
-    # Click the LAST card's title div (RAW resume is at the bottom)
-    last_card = card_title_divs[-1]
-    title = last_card.locator('h3').inner_text()
-    print(f"  [*] Clicking resume: '{title}'")
-    last_card.click()
-    # SPA — no full page reload, just wait for React to re-render the form
-    time.sleep(4)
-    print(f"  [+] Loaded resume: '{title}'")
+        print(f"    [+] Found {len(cards)} resume card(s).")
+
+        # Pick the RAW resume card by name; fall back to the last card.
+        target, target_title = None, ""
+        for c in cards:
+            try:
+                t = c.locator('h3').inner_text().strip()
+            except Exception:
+                t = ""
+            if RAW_RESUME_HINT.lower() in t.lower():
+                target, target_title = c, t
+                break
+        if target is None:
+            target = cards[-1]
+            try:
+                target_title = target.locator('h3').inner_text().strip()
+            except Exception:
+                target_title = "(last card)"
+
+        print(f"    [*] Clicking resume: '{target_title}'")
+        try:
+            target.scroll_into_view_if_needed()
+            target.click()
+        except Exception:
+            try:
+                target.evaluate("el => el.click()")
+            except Exception as e:
+                print(f"    [!] click failed: {str(e)[:70]}")
+                continue
+
+        # Verify the form actually populated (editable description fields appear).
+        loaded = False
+        for _ in range(16):          # up to ~8s for React to render the form
+            n = page.locator(
+                'div.mt-1.px-3.py-2.block.w-full.rounded-md.border.border-gray-300[contenteditable]'
+            ).count()
+            if n >= 2:
+                loaded = True
+                break
+            time.sleep(0.5)
+
+        if loaded:
+            print(f"  [+] Loaded resume: '{target_title}'")
+            time.sleep(1.5)
+            return True
+        print("    [!] Resume didn't load (no form fields) — retrying...")
+        time.sleep(1.5)
+
+    print("  [!] Could not load the RAW resume after 3 attempts.")
+    return False
 
 
 def clear_and_type_input(el, value):
@@ -407,6 +490,14 @@ def update_resume(page, row, max_pages=1):
         'div.mt-1.px-3.py-2.block.w-full.rounded-md.border.border-gray-300[contenteditable]'
     ).all()
     print(f"  [*] Found {len(desc_els)} contenteditable description field(s).")
+
+    # ── Summary Textbox (contenteditable index 0) ← Summary (column C) ────
+    if row["summary"] and len(desc_els) >= 1:
+        try:
+            clear_and_type_contenteditable(desc_els[0], row["summary"])
+            print("  [+] Summary Textbox filled.")
+        except Exception as e:
+            print(f"  [!] Summary Textbox failed: {e}")
 
     ex1_bullets = split_bullets(row["ex_desc_1"])
     ex2_bullets = split_bullets(row["ex_desc_2"])

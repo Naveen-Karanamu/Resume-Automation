@@ -623,7 +623,48 @@ def get_sheet_page(context):
     return page
 
 
-def sheet_get_prompt(page, keywords, jd):
+def _norm_tab(s):
+    """Normalise a tab/category name for matching: lowercase, strip, remove
+    all non-alphanumeric chars (so 'AI ML Engineer' == 'AIML ENGINEER')."""
+    return re.sub(r'[^a-z0-9]', '', (s or "").lower())
+
+
+def select_sheet_tab(page, category):
+    """Click the bottom sheet tab whose name matches `category`.
+    Returns True if a matching tab was found and activated, else False.
+    Matching is case/space-insensitive ('AI ML Engineer' -> 'AIML ENGINEER')."""
+    target = _norm_tab(category)
+    if not target:
+        return False
+    try:
+        # Google Sheets bottom tabs: each sheet tab name sits in an element with
+        # class 'docs-sheet-tab-name' inside a 'docs-sheet-tab' container.
+        tabs = page.locator('.docs-sheet-tab-name').all()
+        names = []
+        for t in tabs:
+            try:
+                nm = (t.inner_text() or "").strip()
+            except Exception:
+                nm = ""
+            names.append(nm)
+            if _norm_tab(nm) == target:
+                t.scroll_into_view_if_needed()
+                t.click()
+                time.sleep(1.2)
+                print(f"    [+] Switched to sheet tab '{nm}'.")
+                return True
+        print(f"    [!] No sheet tab matches category '{category}'. "
+              f"Available tabs: {names}")
+        return False
+    except Exception as e:
+        print(f"    [!] select_sheet_tab failed: {str(e)[:90]}")
+        return False
+
+
+def sheet_get_prompt(page, keywords, jd, category=None):
+    # Switch to the sheet tab for this category before pasting / reading.
+    if category:
+        select_sheet_tab(page, category)
     clear_cell(page, KEYWORDS_CELL)
     paste_cell(page, KEYWORDS_CELL, keywords)
     paste_cell(page, JD_CELL, jd)
@@ -631,6 +672,16 @@ def sheet_get_prompt(page, keywords, jd):
     go_to_cell(page, PROMPT_RANGE)
     page.keyboard.press("Control+c"); time.sleep(0.8)
     prompt = (read_clipboard(page) or "").strip()
+
+    # Clean up the sheet's input cells so the next job/category starts fresh
+    # (keywords in A9 and JD in B3 don't carry over).
+    try:
+        clear_cell(page, KEYWORDS_CELL)
+        clear_cell(page, JD_CELL)
+        print("    [+] Cleared sheet input cells (A9, B3).")
+    except Exception as e:
+        print(f"    [~] Sheet cleanup failed: {str(e)[:70]}")
+
     return prompt
 
 
@@ -844,11 +895,15 @@ def parse_sections(text):
         r'The following job-description)',
         re.IGNORECASE)
 
-    raw_lines = [ln.strip() for ln in text.splitlines()]
-    # drop noise lines: 'Writing' artifacts and the 'ChatGPT said:' prefix.
-    lines = [ln for ln in raw_lines
-             if ln and ln.lower() != "writing"
-             and not re.match(r'^chatgpt said\s*:?\s*$', ln, re.IGNORECASE)]
+    # Strip a leading "ChatGPT said:" prefix (it can appear on its own line OR
+    # inline at the start of the summary line, e.g. "ChatGPT said: Data ...").
+    raw_lines = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        ln = re.sub(r'^chatgpt said\s*:?\s*', '', ln, flags=re.IGNORECASE)
+        raw_lines.append(ln)
+    # drop noise lines: empties and 'Writing' artifacts
+    lines = [ln for ln in raw_lines if ln and ln.lower() != "writing"]
 
     # A role header marks the start of an experience block. Observed formats:
     #   "Responsibilities 1: Techzert AI Engineer | New York, NY | Nov 2024 - Present"
@@ -862,10 +917,23 @@ def parse_sections(text):
             r'^[A-Za-z]{3,9}\.?\s*\d{4}\s*[–\-]\s*(present|[A-Za-z]{3,9}\.?\s*\d{4})',
             ln, re.IGNORECASE))
 
+    def is_summary_heading(ln):
+        # A summary heading can be "Professional Summary", "Summary", or a
+        # category-prefixed form like "AIML ENGINEER — PROFESSIONAL SUMMARY".
+        # It's a short heading (not a sentence) that contains 'summary'.
+        if ln.rstrip().endswith((".", "%", ")")):
+            return False
+        return bool(re.search(r'\bprofessional\s+summary\b', ln, re.IGNORECASE)
+                    or re.match(r'^summary\s*$', ln, re.IGNORECASE))
+
     def is_role_header(ln):
         # Never treat a standalone date range as a role header (its dash would
         # otherwise look like a "Company – Title" separator).
         if is_date_line(ln):
+            return False
+        # Never treat a summary heading as a role header, even if it contains a
+        # dash (e.g. "AIML ENGINEER — PROFESSIONAL SUMMARY").
+        if is_summary_heading(ln):
             return False
         # (a) explicit "Responsibilities N:" / "Experience N:" label
         if re.match(r'^(responsibilit(?:y|ies)|experience)\s*\d*\s*[:\-]',
@@ -906,7 +974,7 @@ def parse_sections(text):
     for i, ln in enumerate(lines):
         if TRAILING.match(ln):
             break
-        if re.match(r'^Professional Summary', ln, re.IGNORECASE):
+        if is_summary_heading(ln):
             continue
         # Role headers take precedence over meta classification.
         if is_role_header(ln):
@@ -941,7 +1009,7 @@ def parse_sections(text):
     summary_lines = []
     end = role_idxs[0] if role_idxs else len(lines)
     for ln in lines[:end]:
-        if re.match(r'^Professional Summary', ln, re.IGNORECASE):
+        if is_summary_heading(ln):
             continue
         if is_meta(ln):
             continue
@@ -1090,7 +1158,7 @@ def process_job(context, builder_page, sheet_page, wb, ws, row, candidate=None):
         print(f"  [3] {jid}: Sheet prompt...")
         if sheet_page is None:
             pipe_set(ws, row, status="error:sheet_login"); pipe_save(wb); return False
-        prompt = sheet_get_prompt(sheet_page, keywords, jd)
+        prompt = sheet_get_prompt(sheet_page, keywords, jd, category=category)
         if not prompt:
             pipe_set(ws, row, status="error:prompt"); pipe_save(wb); return False
         pipe_set(ws, row, prompt=prompt, status="prompt"); pipe_save(wb)
