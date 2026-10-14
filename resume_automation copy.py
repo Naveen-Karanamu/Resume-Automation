@@ -170,14 +170,37 @@ def _bold_segments(value):
     return segs
 
 
-def clear_and_type_contenteditable(el, value):
-    """Click, clear, then type `value` into the contenteditable, converting
-    markdown **bold** markers into REAL bold text.
+def _html_escape(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
-    The resume builder does not render markdown, so literal '**' would appear
-    in the resume. Instead we toggle rich-text bold (document.execCommand) around
-    each bold segment, producing <b>...</b> that the builder renders as bold and
-    that shows up bold in the downloaded PDF.
+
+def _markdown_to_html(value):
+    """Convert a string with **bold** markers and newlines into builder HTML:
+    each line becomes a <div ...>...</div> and **word** becomes <b>word</b>."""
+    html_lines = []
+    for ln in value.split("\n"):
+        parts = []
+        for text, is_bold in _bold_segments(ln):
+            if not text:
+                continue
+            esc = _html_escape(text)
+            parts.append(f"<b>{esc}</b>" if is_bold else esc)
+        inner = "".join(parts) if parts else "<br>"
+        html_lines.append(
+            '<div style="line-height: 1.5; text-align: justify;">' + inner + '</div>'
+        )
+    return "".join(html_lines)
+
+
+def clear_and_type_contenteditable(el, value):
+    """Fill a contenteditable, converting markdown **bold** into REAL bold.
+
+    The resume builder does not render markdown, so literal '**' would show in
+    the resume. We set the element's innerHTML directly with <b>...</b> tags
+    (deterministic — no reliance on cursor focus / execCommand), then dispatch
+    an input event so the builder's React state and PDF preview update.
+
+    For plain text (no ** markers) we keep the fast keyboard-insert path.
     """
     page = el.page
     el.scroll_into_view_if_needed()
@@ -186,20 +209,15 @@ def clear_and_type_contenteditable(el, value):
     el.press("Delete")
 
     if "**" not in value:
-        # no bold markers — fast path: insert the whole string at once
         page.keyboard.insert_text(value)
     else:
-        bold_on = False
-        for text, is_bold in _bold_segments(value):
-            if is_bold != bold_on:
-                page.evaluate("document.execCommand('bold', false, null)")
-                bold_on = is_bold
-            if text:
-                page.keyboard.insert_text(text)
-        if bold_on:                      # turn bold back off at the end
-            page.evaluate("document.execCommand('bold', false, null)")
+        html = _markdown_to_html(value)
+        el.evaluate(
+            "(node, html) => { node.focus(); node.innerHTML = html; "
+            "node.dispatchEvent(new InputEvent('input', {bubbles: true})); }",
+            html,
+        )
 
-    # notify React that the field changed so the preview/state updates
     try:
         el.evaluate("e => e.dispatchEvent(new InputEvent('input', {bubbles:true}))")
     except Exception:
