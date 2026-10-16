@@ -1235,11 +1235,29 @@ def main():
               f"Add them as 'key=value' lines and re-run.")
         return
 
-    # Make sure resume_data.xlsx exists with a header row
-    if not RESUME_XLSX.exists():
-        wbz = openpyxl.Workbook(); wsz = wbz.active
+    # Reset resume_data.xlsx to header-only only on a completely fresh run
+    # (no 'done' rows in pipeline_data.xlsx). If a previous run was interrupted,
+    # keep the existing resume_data.xlsx so already-written rows are preserved.
+    is_fresh_run = True
+    if PIPELINE_XLSX.exists():
+        try:
+            _wb = openpyxl.load_workbook(PIPELINE_XLSX)
+            _ws = _wb.active
+            for _r in range(2, _ws.max_row + 1):
+                if str(_ws.cell(_r, C["status"]).value or "").strip() == "done":
+                    is_fresh_run = False
+                    break
+        except Exception:
+            pass
+
+    if is_fresh_run or not RESUME_XLSX.exists():
+        wbz = openpyxl.Workbook()
+        wsz = wbz.active
         wsz.append(["Job Title", "Job Location", "Summary", "Ex Desc 1", "Ex Desc 2", "Resume Name"])
         wbz.save(RESUME_XLSX)
+        print("[*] resume_data.xlsx reset to header-only (fresh run).")
+    else:
+        print("[*] resume_data.xlsx kept from previous run (resuming).")
 
     chrome_proc = None if debug_port_up() else launch_chrome()
     if chrome_proc is None:
