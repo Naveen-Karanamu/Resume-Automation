@@ -37,7 +37,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 WEBSITE_URL  = "https://builder.firststepjob.com/resume-builder"
 CREDS_FILE   = Path(__file__).parent / "credentials.txt"
 EXCEL_FILE   = Path(__file__).parent / "resume_data.xlsx"
-DOWNLOAD_DIR = Path(r"C:\Users\617404611\Downloads\Temp res")
+DOWNLOAD_DIR = Path(r"C:\Users\karan\Downloads\Resumes")
 
 HEADLESS = False   # False = watch the browser; True = run silently
 SLOW_MO  = 200     # ms between actions
@@ -47,7 +47,10 @@ SLOW_MO  = 200     # ms between actions
 # MAX_PAGES is read from credentials.txt ('max_pages='); this is a fallback.
 FIT_PAGES   = True
 MAX_PAGES   = 1       # default page cap if credentials.txt has no 'max_pages'
-MIN_BULLETS = 2       # never trim an experience below this many bullet points
+MIN_BULLETS        = 3   # never trim Ex Desc 1 & 2 below this many bullet points
+MIN_BULLETS_EX1    = 4   # floor for Ex Desc 1 specifically
+MIN_BULLETS_EX2    = 3   # floor for Ex Desc 2 specifically
+MIN_BULLETS_EXTRA  = 1   # Ex Desc 3 & 4 can go down to 1 bullet if needed
 MAX_TRIM_ITERS = 40   # generous safety cap (enough to trim both lists to MIN)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -257,9 +260,11 @@ def _html_escape(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def _markdown_to_html(value):
+def _markdown_to_html(value, paragraph=False):
     """Convert a string with **bold** markers and newlines into builder HTML:
-    each line becomes a <div ...>...</div> and **word** becomes <b>word</b>."""
+    each line becomes a <div ...>...</div> and **word** becomes <b>word</b>.
+    If paragraph=True, the whole value is rendered as a single inline block
+    (sentences separated by a space, not block divs) — used for the summary."""
     html_lines = []
     for ln in value.split("\n"):
         parts = []
@@ -268,14 +273,21 @@ def _markdown_to_html(value):
                 continue
             esc = _html_escape(text)
             parts.append(f"<b>{esc}</b>" if is_bold else esc)
-        inner = "".join(parts) if parts else "<br>"
-        html_lines.append(
-            '<div style="line-height: 1.5; text-align: justify;">' + inner + '</div>'
-        )
-    return "".join(html_lines)
+        inner = "".join(parts)
+        if inner:
+            html_lines.append(inner)
+
+    if paragraph:
+        combined = " ".join(html_lines)
+        return f'<p style="line-height: 1.5; text-align: justify; margin: 0;">{combined}</p>'
+
+    return "".join(
+        f'<div style="line-height: 1.5; text-align: justify;">{inner or "<br>"}</div>'
+        for inner in html_lines
+    )
 
 
-def clear_and_type_contenteditable(el, value):
+def clear_and_type_contenteditable(el, value, paragraph=False):
     """Fill a contenteditable, converting markdown **bold** into REAL bold.
 
     The resume builder does not render markdown, so literal '**' would show in
@@ -284,6 +296,7 @@ def clear_and_type_contenteditable(el, value):
     an input event so the builder's React state and PDF preview update.
 
     For plain text (no ** markers) we keep the fast keyboard-insert path.
+    If paragraph=True, all lines are merged into a single block (for summary).
     """
     page = el.page
     el.scroll_into_view_if_needed()
@@ -291,10 +304,10 @@ def clear_and_type_contenteditable(el, value):
     el.press("Control+a")
     el.press("Delete")
 
-    if "**" not in value:
+    if "**" not in value and not paragraph:
         page.keyboard.insert_text(value)
     else:
-        html = _markdown_to_html(value)
+        html = _markdown_to_html(value, paragraph=paragraph)
         el.evaluate(
             "(node, html) => { node.focus(); node.innerHTML = html; "
             "node.dispatchEvent(new InputEvent('input', {bubbles: true})); }",
@@ -311,7 +324,17 @@ def split_bullets(text):
     """Split an experience description into a list of bullet lines."""
     if not text:
         return []
-    return [ln.strip() for ln in str(text).split("\n") if ln.strip()]
+    bullets = []
+    for ln in str(text).split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        # Remove any leading punctuation characters that shouldn't start a line
+        ln = ln.lstrip(".,;")
+        ln = ln.strip()
+        if ln:
+            bullets.append(ln)
+    return bullets
 
 
 def join_bullets(bullets):
@@ -373,69 +396,111 @@ def get_page_count(page):
     return last if seen_nonzero and last > 0 else None
 
 
-def fill_experience_descs(page, ex1_bullets, ex2_bullets):
-    """(Re)write Ex Desc 1 and Ex Desc 2 contenteditable fields from bullet lists."""
+def fill_experience_descs(page, ex1_bullets, ex2_bullets, ex3_bullets=None, ex4_bullets=None):
+    """(Re)write experience contenteditable fields from bullet lists.
+    Indices: [1]=Summary, [3]=Ex1 (1st), [4]=Ex2 (2nd), [5]=Ex3 (3rd), [6]=Ex4 (4th)"""
     desc_els = page.locator(
         'div.mt-1.px-3.py-2.block.w-full.rounded-md.border.border-gray-300[contenteditable]'
     ).all()
-    if len(desc_els) >= 2 and ex1_bullets is not None:
-        try:
-            clear_and_type_contenteditable(desc_els[1], join_bullets(ex1_bullets))
-        except Exception as e:
-            print(f"      [!] re-fill Ex Desc 1 failed: {str(e)[:80]}")
-    if len(desc_els) >= 4 and ex2_bullets is not None:
-        try:
-            clear_and_type_contenteditable(desc_els[3], join_bullets(ex2_bullets))
-        except Exception as e:
-            print(f"      [!] re-fill Ex Desc 2 failed: {str(e)[:80]}")
+    for idx, (bullets, label) in zip([3, 4, 5, 6], [
+        (ex1_bullets, "Ex Desc 1"),
+        (ex2_bullets, "Ex Desc 2"),
+        (ex3_bullets, "Ex Desc 3"),
+        (ex4_bullets, "Ex Desc 4"),
+    ]):
+        if bullets is not None and len(desc_els) > idx:
+            try:
+                clear_and_type_contenteditable(desc_els[idx], join_bullets(bullets))
+            except Exception as e:
+                print(f"      [!] re-fill {label} failed: {str(e)[:80]}")
     time.sleep(0.8)
 
 
-def fit_to_pages(page, ex1_bullets, ex2_bullets, max_pages=1):
+def fit_to_pages(page, ex1_bullets, ex2_bullets, ex3_bullets=None, ex4_bullets=None, max_pages=1):
     """
     If the resume spills beyond `max_pages`, drop the LAST bullet from the
-    longer of the two experience lists, re-fill, and re-check — repeating until
-    it fits within max_pages or both lists reach MIN_BULLETS.
+    longest experience list, re-fill, and re-check — repeating until it fits
+    within max_pages or all lists reach MIN_BULLETS.
     """
     pages = get_page_count(page)
     if pages is None:
-        print("  [~] Could not read page count — leaving bullets as-is.")
-        return ex1_bullets, ex2_bullets
+        print("  [~] Could not read page count on first check — will attempt trimming anyway.")
+        pages = max_pages + 1  # treat unknown as over the limit so trimming runs
     print(f"  [*] Resume spans {pages} page(s); cap is {max_pages}.")
     if pages <= max_pages:
-        return ex1_bullets, ex2_bullets
+        return ex1_bullets, ex2_bullets, ex3_bullets, ex4_bullets
+
+    # Build a list of all bullet lists that exist (non-None)
+    all_lists = [
+        (ex1_bullets, "Ex Desc 1", MIN_BULLETS_EX1),
+        (ex2_bullets, "Ex Desc 2", MIN_BULLETS_EX2),
+        (ex3_bullets, "Ex Desc 3", MIN_BULLETS_EXTRA),
+        (ex4_bullets, "Ex Desc 4", MIN_BULLETS_EXTRA),
+    ]
 
     for it in range(MAX_TRIM_ITERS):
-        # Can we still trim? Trim the longer list first to keep them balanced.
-        can_trim_1 = len(ex1_bullets) > MIN_BULLETS
-        can_trim_2 = len(ex2_bullets) > MIN_BULLETS
-        if not can_trim_1 and not can_trim_2:
-            print(f"  [!] Reached MIN_BULLETS ({MIN_BULLETS}) in both; "
+        # Trim in strict order: Ex1 first, then Ex2, then Ex3, then Ex4.
+        # Never move to the next block until the current one hits its floor.
+        # This keeps each work experience block intact on one page rather than
+        # splitting bullets across a page boundary.
+        trimmed = False
+        for bl, lbl, floor in all_lists:
+            if bl is not None and len(bl) > floor:
+                dropped = bl.pop()
+                print(f"  [-] Trimming {lbl} -> now "
+                      f"{len(ex1_bullets) if ex1_bullets else 0}/"
+                      f"{len(ex2_bullets) if ex2_bullets else 0}/"
+                      f"{len(ex3_bullets) if ex3_bullets else 0}/"
+                      f"{len(ex4_bullets) if ex4_bullets else 0} bullets "
+                      f"(removed: '{dropped[:50]}...')")
+                trimmed = True
+                break
+
+        if not trimmed:
+            print(f"  [!] Reached minimum bullets in all lists; "
                   f"still {pages} page(s) (cap {max_pages}). Cannot trim further.")
             break
 
-        if can_trim_1 and (len(ex1_bullets) >= len(ex2_bullets) or not can_trim_2):
-            dropped = ex1_bullets.pop()
-            which = "Ex Desc 1"
-        else:
-            dropped = ex2_bullets.pop()
-            which = "Ex Desc 2"
-        print(f"  [-] Trimming {which} -> now "
-              f"{len(ex1_bullets)}/{len(ex2_bullets)} bullets "
-              f"(removed: '{dropped[:50]}...')")
-
-        fill_experience_descs(page, ex1_bullets, ex2_bullets)
+        fill_experience_descs(page, ex1_bullets, ex2_bullets, ex3_bullets, ex4_bullets)
         pages = get_page_count(page)
+        if pages is None:
+            print(f"      -> page count unreadable, continuing to trim.")
+            continue
         print(f"      -> now {pages} page(s).")
-        if pages is not None and pages <= max_pages:
+        if pages <= max_pages:
             print(f"  [+] Fits within {max_pages} page(s).")
             break
 
-    return ex1_bullets, ex2_bullets
+    return ex1_bullets, ex2_bullets, ex3_bullets, ex4_bullets
 
 
 def update_resume(page, row, max_pages=1):
     print("  [*] Filling resume fields...")
+
+    # ── Inject page-break CSS so work experience blocks never split across pages ──
+    try:
+        page.evaluate("""() => {
+            const style = document.createElement('style');
+            style.id = 'kiro-page-break-fix';
+            style.textContent = `
+                @media print {
+                    .work-experience-item,
+                    [class*="experience"],
+                    [class*="work-ex"],
+                    [class*="job-block"],
+                    [class*="position"] {
+                        page-break-inside: avoid !important;
+                        break-inside: avoid !important;
+                    }
+                }
+            `;
+            if (!document.getElementById('kiro-page-break-fix')) {
+                document.head.appendChild(style);
+            }
+        }""")
+        print("  [+] Page-break CSS injected.")
+    except Exception as e:
+        print(f"  [~] Page-break CSS injection failed: {e}")
 
     # ── Objective (textarea name="summary") → Job Title ───────────────────
     if row["job_title"]:
@@ -482,19 +547,46 @@ def update_resume(page, row, max_pages=1):
 
     # ── Experience Description contenteditable divs ───────────────────────
     # On a loaded resume these divs have NO data-placeholder — select by class only.
-    # Index 0 = Summary/profile description
-    # Index 1 = 1st work experience description  ← Ex Desc 1
-    # Index 2 = 2nd work experience description
-    # Index 3 = 3rd work experience description  ← Ex Desc 2
+    # Index 0 = unknown/empty field
+    # Index 1 = Summary/profile description      ← Summary (column C)
+    # Index 2 = empty
+    # Index 3 = 1st work experience description  ← Ex Desc 1
+    # Index 4 = 2nd work experience description  ← Ex Desc 2
+    # Index 5 = 3rd work experience description  ← trimmed if needed
+    # Index 6 = 4th work experience description  ← trimmed if needed
     desc_els = page.locator(
         'div.mt-1.px-3.py-2.block.w-full.rounded-md.border.border-gray-300[contenteditable]'
     ).all()
     print(f"  [*] Found {len(desc_els)} contenteditable description field(s).")
-
-    # ── Summary Textbox (contenteditable index 0) ← Summary (column C) ────
-    if row["summary"] and len(desc_els) >= 1:
+    for i, el in enumerate(desc_els):
         try:
-            clear_and_type_contenteditable(desc_els[0], row["summary"])
+            preview = el.inner_text().strip().replace("\n", " ")[:80]
+        except Exception:
+            preview = "?"
+        print(f"      desc_els[{i}]: '{preview}'")
+
+    # ── Summary Textbox (contenteditable index 1) ← Summary (column C) ────
+    if row["summary"] and len(desc_els) >= 2:
+        try:
+            summary_text = " ".join(
+                ln.strip() for ln in row["summary"].splitlines() if ln.strip()
+            )
+            print(f"  [*] Summary text ({len(summary_text)} chars): {summary_text[:120]}...")
+            el = desc_els[1]
+            el.scroll_into_view_if_needed()
+            el.click()
+            el.press("Control+a")
+            el.press("Delete")
+            html = _markdown_to_html(summary_text, paragraph=True)
+            el.evaluate(
+                "(node, html) => { node.focus(); node.innerHTML = html; "
+                "node.dispatchEvent(new InputEvent('input', {bubbles: true})); }",
+                html,
+            )
+            try:
+                el.evaluate("e => e.dispatchEvent(new InputEvent('input', {bubbles:true}))")
+            except Exception:
+                pass
             print("  [+] Summary Textbox filled.")
         except Exception as e:
             print(f"  [!] Summary Textbox failed: {e}")
@@ -502,27 +594,53 @@ def update_resume(page, row, max_pages=1):
     ex1_bullets = split_bullets(row["ex_desc_1"])
     ex2_bullets = split_bullets(row["ex_desc_2"])
 
-    if ex1_bullets and len(desc_els) >= 2:
+    if ex1_bullets and len(desc_els) >= 4:
         try:
-            clear_and_type_contenteditable(desc_els[1], join_bullets(ex1_bullets))
+            clear_and_type_contenteditable(desc_els[3], join_bullets(ex1_bullets))
             print(f"  [+] Ex Desc 1 (1st work ex) filled ({len(ex1_bullets)} bullets).")
         except Exception as e:
             print(f"  [!] Ex Desc 1 failed: {e}")
 
-    if ex2_bullets and len(desc_els) >= 4:
+    if ex2_bullets and len(desc_els) >= 5:
         try:
-            clear_and_type_contenteditable(desc_els[3], join_bullets(ex2_bullets))
-            print(f"  [+] Ex Desc 2 (3rd work ex) filled ({len(ex2_bullets)} bullets).")
+            clear_and_type_contenteditable(desc_els[4], join_bullets(ex2_bullets))
+            print(f"  [+] Ex Desc 2 (2nd work ex) filled ({len(ex2_bullets)} bullets).")
         except Exception as e:
             print(f"  [!] Ex Desc 2 failed: {e}")
     elif ex2_bullets:
         print(f"  [~] Only {len(desc_els)} description field(s) — skipping Ex Desc 2.")
 
+    # Read existing bullets from Ex Desc 3 (index 5) and Ex Desc 4 (index 6)
+    # using innerHTML so <b> tags are preserved and converted back to **markers**.
+    def read_existing_bullets(el):
+        try:
+            html = el.evaluate("e => e.innerHTML")
+            if not html:
+                return None
+            # Convert <b>...</b> back to **...**
+            import re as _re
+            text = _re.sub(r'<b>(.*?)</b>', lambda m: f'**{m.group(1)}**', html, flags=_re.DOTALL)
+            # Each <div> is a line; strip all remaining tags
+            text = _re.sub(r'<div[^>]*>', '\n', text)
+            text = _re.sub(r'<[^>]+>', '', text)
+            import html as _html
+            text = _html.unescape(text).strip()
+            return split_bullets(text) if text else None
+        except Exception:
+            return None
+
+    ex3_bullets = read_existing_bullets(desc_els[5]) if len(desc_els) > 5 else None
+    ex4_bullets = read_existing_bullets(desc_els[6]) if len(desc_els) > 6 else None
+    if ex3_bullets:
+        print(f"  [*] Ex Desc 3 (2nd work ex) has {len(ex3_bullets)} existing bullets.")
+    if ex4_bullets:
+        print(f"  [*] Ex Desc 4 (4th work ex) has {len(ex4_bullets)} existing bullets.")
+
     time.sleep(1)
 
     # ── Fit the resume within max_pages by trimming bullets if needed ─────
-    if FIT_PAGES and (ex1_bullets or ex2_bullets):
-        fit_to_pages(page, ex1_bullets, ex2_bullets, max_pages=max_pages)
+    if FIT_PAGES and (ex1_bullets or ex2_bullets or ex3_bullets or ex4_bullets):
+        fit_to_pages(page, ex1_bullets, ex2_bullets, ex3_bullets, ex4_bullets, max_pages=max_pages)
 
     time.sleep(1)
 
@@ -608,7 +726,17 @@ def run_for_row(browser, email, password, row, index, max_pages=1):
         login(page, email, password)
         load_last_resume(page)
         update_resume(page, row, max_pages=max_pages)
-        download_resume(page, row["resume_name"] or row["job_title"] or f"resume_{index}")
+
+        # Guard: verify page count before downloading. If still over the limit,
+        # skip the download and warn rather than saving an oversized resume.
+        final_pages = get_page_count(page)
+        if final_pages is not None and final_pages > max_pages:
+            print(f"  [!] SKIPPING download — resume is {final_pages} page(s) "
+                  f"but max is {max_pages}. Trim could not reduce it further.")
+        else:
+            if final_pages is None:
+                print(f"  [~] Page count unreadable before download — proceeding anyway.")
+            download_resume(page, row["resume_name"] or row["job_title"] or f"resume_{index}")
     except Exception as e:
         print(f"  [ERROR] Row {index}: {e}")
     finally:
