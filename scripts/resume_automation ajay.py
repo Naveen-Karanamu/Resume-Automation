@@ -57,7 +57,7 @@ MAX_TRIM_ITERS = 40   # generous safety cap (enough to trim both lists to MIN)
 
 
 def read_credentials():
-    """Return (email, password, max_pages, download_dir) from credentials.txt."""
+    """Return (email, password, max_pages, download_dir, desc_indices) from credentials.txt."""
     creds = {}
     with open(CREDS_FILE, "r") as f:
         for line in f:
@@ -79,7 +79,20 @@ def read_credentials():
     # download_dir: falls back to hardcoded default if absent.
     download_dir = Path(creds["download_dir"]) if creds.get("download_dir") else DOWNLOAD_DIR
 
-    return creds["email"], creds["password"], max_pages, download_dir
+    # desc field indices — fixed per resume template, set in credentials.txt
+    def _idx(key, default):
+        try:
+            return int(creds[key])
+        except (KeyError, ValueError):
+            return default
+
+    desc_indices = {
+        "summary": _idx("summary_idx", 0),
+        "ex1":     _idx("ex1_idx", 1),
+        "ex2":     _idx("ex2_idx", 2),
+    }
+
+    return creds["email"], creds["password"], max_pages, download_dir, desc_indices
 
 
 def read_excel():
@@ -482,7 +495,9 @@ def fit_to_pages(page, ex1_bullets, ex2_bullets, ex3_bullets=None, ex4_bullets=N
     return ex1_bullets, ex2_bullets, ex3_bullets, ex4_bullets
 
 
-def update_resume(page, row, max_pages=1):
+def update_resume(page, row, max_pages=1, desc_indices=None):
+    if desc_indices is None:
+        desc_indices = {"summary": 0, "ex1": 1, "ex2": 2}
     print("  [*] Filling resume fields...")
 
     # ── Inject page-break CSS so work experience blocks never split across pages ──
@@ -554,14 +569,6 @@ def update_resume(page, row, max_pages=1):
             print(f"  [~] Only {len(job_title_els)} jobTitle field(s) — skipping 3rd.")
 
     # ── Experience Description contenteditable divs ───────────────────────
-    # On a loaded resume these divs have NO data-placeholder — select by class only.
-    # Index 0 = unknown/empty field
-    # Index 1 = Summary/profile description      ← Summary (column C)
-    # Index 2 = empty
-    # Index 3 = 1st work experience description  ← Ex Desc 1
-    # Index 4 = 2nd work experience description  ← Ex Desc 2
-    # Index 5 = 3rd work experience description  ← trimmed if needed
-    # Index 6 = 4th work experience description  ← trimmed if needed
     desc_els = page.locator(
         'div.mt-1.px-3.py-2.block.w-full.rounded-md.border.border-gray-300[contenteditable]'
     ).all()
@@ -573,30 +580,13 @@ def update_resume(page, row, max_pages=1):
             preview = "?"
         print(f"      desc_els[{i}]: '{preview}'")
 
-    def find_desc_index(els, hint, start=0):
-        """Find the index of the element whose text best matches the first
-        30 chars of hint. Returns None if no match found."""
-        if not hint:
-            return None
-        needle = hint.strip()[:30].lower()
-        for i in range(start, len(els)):
-            try:
-                txt = els[i].inner_text().strip()[:30].lower()
-                if txt and needle and (txt in needle or needle in txt or
-                        txt[:15] == needle[:15]):
-                    return i
-            except Exception:
-                pass
-        return None
-
-    # Detect indices by matching existing content
-    summary_idx  = find_desc_index(desc_els, row["summary"])
-    ex1_idx      = find_desc_index(desc_els, row["ex_desc_1"],
-                                   start=(summary_idx + 1) if summary_idx is not None else 0)
-    ex2_idx      = find_desc_index(desc_els, row["ex_desc_2"],
-                                   start=(ex1_idx + 1) if ex1_idx is not None else 0)
-
-    print(f"  [*] Detected indices — summary:{summary_idx} ex1:{ex1_idx} ex2:{ex2_idx}")
+    # Use fixed indices from credentials.txt
+    summary_idx = desc_indices["summary"]
+    ex1_idx     = desc_indices["ex1"]
+    ex2_idx     = desc_indices["ex2"]
+    ex3_idx     = ex2_idx + 1 if ex2_idx + 1 < len(desc_els) else None
+    ex4_idx     = ex2_idx + 2 if ex2_idx + 2 < len(desc_els) else None
+    print(f"  [*] Using indices — summary:{summary_idx} ex1:{ex1_idx} ex2:{ex2_idx}")
 
     # ── Summary ────────────────────────────────────────────────────────────
     if row["summary"] and summary_idx is not None:
@@ -754,7 +744,7 @@ def download_resume(page, resume_name, download_dir=None):
     return False
 
 
-def run_for_row(browser, email, password, row, index, max_pages=1, download_dir=None):
+def run_for_row(browser, email, password, row, index, max_pages=1, download_dir=None, desc_indices=None):
     print(f"\n{'='*60}")
     print(f"  Row {index} | Job Title: {row['job_title']}")
     print(f"{'='*60}")
@@ -768,7 +758,7 @@ def run_for_row(browser, email, password, row, index, max_pages=1, download_dir=
     try:
         login(page, email, password)
         load_last_resume(page)
-        update_resume(page, row, max_pages=max_pages)
+        update_resume(page, row, max_pages=max_pages, desc_indices=desc_indices)
 
         # Guard: verify page count before downloading. If still over the limit,
         # skip the download and warn rather than saving an oversized resume.
@@ -792,10 +782,11 @@ def main():
     print("  FirstStep Resume Builder — Batch Automation")
     print("=" * 60)
 
-    email, password, max_pages, download_dir = read_credentials()
+    email, password, max_pages, download_dir, desc_indices = read_credentials()
     print(f"\n[*] Credentials loaded for: {email}")
     print(f"[*] Max pages per resume (from credentials.txt): {max_pages}")
     print(f"[*] Download directory: {download_dir}")
+    print(f"[*] Desc indices: summary={desc_indices['summary']} ex1={desc_indices['ex1']} ex2={desc_indices['ex2']}")
 
     rows = read_excel()
     if not rows:
@@ -807,7 +798,7 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO)
         for i, row in enumerate(rows, start=1):
-            run_for_row(browser, email, password, row, i, max_pages=max_pages, download_dir=download_dir)
+            run_for_row(browser, email, password, row, i, max_pages=max_pages, download_dir=download_dir, desc_indices=desc_indices)
         browser.close()
 
     print(f"\n[+] All done! PDFs saved in: {download_dir}")
